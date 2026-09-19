@@ -15,6 +15,41 @@ namespace {
 constexpr int32_t INF_H = 1 << 30;
 constexpr int BLK_SIZE = 256;
 
+// 64 位原子加。
+//
+// 【国产平台适配】天数智芯（Iluvatar）加速卡上 atomicAdd(unsigned long long*) 与
+// atomicCAS(unsigned long long*) 是“静默失效”的：可编译、可启动、cudaDeviceSynchronize
+// 也不报错，但目标内存不变（实测 1024 个线程各加 1，结果仍为 0）。因此原先用 atomicCAS
+// 自旋实现的 64 位原子加在该平台会永久自旋（现象：进程空转、CPU/GPU 利用率都极低）。
+// 这里在该平台改用“两个 32 位原子”模拟 64 位加法：低 32 位 atomicAdd 并判断进位/借位，
+// 高 32 位按需更新。只依赖 32 位原子（实测正常）。本文件的 3 处调用都不使用返回值。
+#if defined(PLATFORM_ILUVATAR) || defined(__ILUVATAR__) || defined(__Iluvatar__)
+__device__ inline int64_t atomicAdd64(int64_t* addr, int64_t val) {
+    // 小端：words[0] 为低 32 位，words[1] 为高 32 位
+    unsigned int* words = reinterpret_cast<unsigned int*>(addr);
+    if (val >= 0) {
+        const unsigned long long mag = static_cast<unsigned long long>(val);
+        const unsigned int lo = static_cast<unsigned int>(mag);
+        const unsigned int hi = static_cast<unsigned int>(mag >> 32);
+        const unsigned int old_lo = atomicAdd(&words[0], lo);
+        const unsigned int carry = (old_lo + lo < old_lo) ? 1u : 0u;
+        if (hi + carry != 0u) {
+            atomicAdd(&words[1], hi + carry);
+        }
+    } else {
+        // 取绝对值（避免对 INT64_MIN 取负溢出）
+        const unsigned long long mag = static_cast<unsigned long long>(-(val + 1)) + 1ULL;
+        const unsigned int lo = static_cast<unsigned int>(mag);
+        const unsigned int hi = static_cast<unsigned int>(mag >> 32);
+        const unsigned int old_lo = atomicAdd(&words[0], 0u - lo);
+        const unsigned int borrow = (lo != 0u && old_lo < lo) ? 1u : 0u;
+        if (hi + borrow != 0u) {
+            atomicAdd(&words[1], 0u - (hi + borrow));
+        }
+    }
+    return 0;
+}
+#else
 // 64 位原子加（用 atomicCAS 实现，兼容所有架构）
 __device__ inline int64_t atomicAdd64(int64_t* addr, int64_t val) {
     unsigned long long old = *reinterpret_cast<unsigned long long*>(addr);
@@ -26,6 +61,7 @@ __device__ inline int64_t atomicAdd64(int64_t* addr, int64_t val) {
     } while (assumed != old);
     return (int64_t)old;
 }
+#endif
 
 // ======================= GPU 设备指针 =======================
 struct GpuCtx {

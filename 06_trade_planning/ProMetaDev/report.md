@@ -2,6 +2,7 @@
 
 > 选题：2026 夏季训练营 CUDA 方向项目阶段 · 选题六（贸易网络路由）
 > 环境：WSL2 Ubuntu 22.04 + CUDA 12.2 + NVIDIA RTX 5070 Ti Laptop (12 GB)，编译目标 `sm_90`
+> 国产平台：天数智芯 Iluvatar MR-V100 (32 GB) + IX-ML 4.4.0 / CoreX SDK 4.4.0（见第 9 节，已验证）
 > 算法：Push-Relabel（GPU）+ BFS 全局重标号 + Gap 重标号；CPU 参考用 Edmonds-Karp
 
 ***
@@ -425,7 +426,7 @@ CPU 参考实现本身用**独立的 Python Edmonds-Karp** 交叉验证过（见
 | 组件                                | 实现方式                                               |
 | --------------------------------- | -------------------------------------------------- |
 | Push / Relabel / BFS / Gap kernel | 纯手写 CUDA C++，仅用 `atomicAdd`、`atomicCAS`            |
-| 64 位原子加                           | 用 `atomicCAS` 自实现（不依赖 `atomicAdd(int64_t*)` 的架构支持） |
+| 64 位原子加                           | NVIDIA 上由 `atomicCAS` 自实现；国产平台改用两个 32 位原子模拟（见 9.2） |
 | CPU 参考                            | 自实现 Edmonds-Karp（仅用 STL `queue` / `vector`）        |
 | 图生成器                              | 自实现（Python，纯标准库）                                   |
 | 第三方库                              | **无**（仅 CUDA Runtime + C++ 标准库）                    |
@@ -453,9 +454,10 @@ CPU 参考实现本身用**独立的 Python Edmonds-Karp** 交叉验证过（见
    `ncu` 报 "No kernels were profiled"、`nsys` 的 CUDA kernel 段为空），
    因此本报告的瓶颈判断来自阶段数统计与实测时间吻合，而非 profiler 计数器。
    如需补齐该加分项，需在原生 Linux / AutoDL 上运行。
-6. **未做国产平台适配**（无架构特性依赖，移植成本较低）。
-7. **测试图均为合成随机图**。缺少真实贸易网络（如 UN Comtrade 导出的
+6. **测试图均为合成随机图**。缺少真实贸易网络（如 UN Comtrade 导出的
    双边贸易矩阵）验证，真实图的度分布与社区结构可能与随机图差异较大。
+7. **国产平台只验证了天数智芯一家**（见第 9 节）。海光 DCU / 华为昇腾 / 摩尔线程等
+   其他国产加速卡的编译链路与原子操作语义差异未做验证。
 
 **优化方向**：
 
@@ -531,4 +533,127 @@ source_0 target_0 maxflow_0
 source_1 target_1 maxflow_1
 ...
 ```
+
+***
+
+## 9. 国产平台适配（天数智芯 Iluvatar CoreX）
+
+本题有"国产平台适配"加分项。除了在 NVIDIA 平台完成开发外，本项目在**天数智芯
+Iluvatar MR-V100** 上做了完整的编译、正确性与性能验证，**源码改动只有一个 64 位原子加**。
+
+### 9.1 目标平台环境
+
+| 项目         | 值                                                                        |
+| ---------- | ------------------------------------------------------------------------ |
+| 加速卡        | Iluvatar MR-V100（32 GB 显存，16 个 SM，1500 MHz）                              |
+| 设备算力（报告值）  | `cc = 7.1`，`warpSize = 64`，`maxThreadsPerBlock = 4096`，每 block 共享内存 128 KB |
+| 软件栈        | IX-ML 4.4.0 / Driver 4.4.0 / CoreX SDK 4.4.0，CUDA 兼容层 10.2（`cudart 10020`） |
+| 编译器        | CoreX 自带 `clang++ 18.1.8`（`-x ivcore`）                                   |
+| 宿主机        | 云上 Ubuntu，Python 3.12，容器镜像 IX-ML 4.4.0                                     |
+
+编译设备代码必须显式指定语言，并链接 CoreX 的 `libcudart`：
+
+```bash
+clang++ -x ivcore -std=c++17 -O3 -DPLATFORM_ILUVATAR \
+        -I<root>/include -I$COREX/include -L$COREX/lib64 -lcudart ...
+```
+
+运行前**必须**导出 `LD_LIBRARY_PATH=$COREX/lib64`，否则报
+`error while loading shared libraries: libcudart.so.10.2`。
+以上步骤已封装为 [`build_iluvatar.sh`](build_iluvatar.sh)（自动探测 `/usr/local/corex-4.4.0`，
+可用 `COREX_HOME` 覆盖）。
+
+### 9.2 移植中唯一的硬问题：64 位原子操作"静默失效"
+
+在天数平台上，64 位浮点/整型普通读写正常，但**64 位原子操作不生效**，
+且不报任何错误——`cudaGetLastError()` 返回 `cudaSuccess`、`cudaDeviceSynchronize()`
+也正常返回，只有目标内存的值始终不变：
+
+| 操作                              | NVIDIA RTX 5070 Ti | 天数 MR-V100     |
+| ------------------------------- | ------------------ | -------------- |
+| `atomicAdd(int*)` / `(uint*)` / `(float*)` | ✓                  | ✓              |
+| `atomicExch` / `atomicCAS(int*)` | ✓                  | ✓              |
+| 64 位普通读 / 写                       | ✓                  | ✓              |
+| `atomicAdd(unsigned long long*)` | ✓                  | **✗ 恒为 0**      |
+| `atomicCAS(unsigned long long*)` | ✓                  | **✗ 自旋死循环**    |
+
+复现方式：1024 个线程各对同一个 `unsigned long long` 做一次 `atomicAdd(…, 1)`，
+NVIDIA 上得到 1024，天数上得到 0。
+
+这个坑在本项目里是**致命的**，因为 `excess[]`（节点盈余）是 `int64_t`：
+10⁶ 条边、容量上限 10⁴ 时总流可达 10¹⁰ 量级，超过 `int32` 范围，不能用 32 位替代。
+而初版 `atomicAdd64` 正好用 `atomicCAS` 自旋实现（见第 6 节），在源点饱和推送后
+第一次写 `excess` 就永久自旋：进程不崩溃、CPU/GPU 利用率都很低，看起来像"卡住"。
+
+**修复**：在 `PLATFORM_ILUVATAR`（以及编译器的 `__ILUVATAR__` / `__Iluvatar__`）
+分支下，用**两个 32 位原子**模拟 64 位加法——小端机器上 `words[0]` 是低 32 位、
+`words[1]` 是高 32 位；低 32 位 `atomicAdd` 后由返回值判断进位/借位，高 32 位按需更新：
+
+```cpp
+// 加法：先加低 32 位，溢出则高位补 1
+const unsigned int old_lo = atomicAdd(&words[0], lo);
+const unsigned int carry = (old_lo + lo < old_lo) ? 1u : 0u;
+if (hi + carry != 0u) atomicAdd(&words[1], hi + carry);
+
+// 减法：先减低 32 位，下溢则高位借 1
+const unsigned int old_lo = atomicAdd(&words[0], 0u - lo);
+const unsigned int borrow = (lo != 0u && old_lo < lo) ? 1u : 0u;
+if (hi + borrow != 0u) atomicAdd(&words[1], 0u - (hi + borrow));
+```
+
+本文件的 3 处调用点（`source_push_kernel`、`push_kernel` 的两处）都不使用返回值，
+因此可以直接改写为"无返回值"语义。NVIDIA 分支仍保留原来的 `atomicCAS` 自实现，
+两个平台的执行路径互不影响。
+
+### 9.3 可移植性小结：为什么移植成本可以这么低
+
+| 潜在障碍            | 本项目情况                                         |
+| --------------- | --------------------------------------------- |
+| warp 级原语        | **未使用**（无 `__shfl` / `__ballot` / `__syncthreads_count`） |
+| 设备侧 FP64        | **未使用**（内核只做 32/64 位整数运算与原子操作）                 |
+| Hopper/Blackwell 专属特性 | 未使用（WGMMA / TMA / FP8 / cluster 均无）             |
+| 块大小与 warpSize   | `BLK_SIZE = 256` 是 64 的整数倍，在 `warpSize=64` 上无隐患  |
+| 主机端库依赖          | 无第三方库，只依赖 CUDA Runtime                        |
+
+因此除 9.2 的 64 位原子外，`src/` 下**源码零改动**即可编译运行。
+
+### 9.4 天数平台验证结果（MR-V100）
+
+`./maxflow selftest` → **PASS**（GPU 与 CPU 均得 5）。
+六个规模、每档 12 个查询，GPU 结果与 CPU Edmonds-Karp **逐查询全部一致**：
+
+| 规模 (N, M)           | 阶段数 | T\_preprocess | TTFQ      | T\_total   | TPQ        |
+| ------------------- | --- | ------------- | --------- | ---------- | ---------- |
+| 20, 100             | 16  | 19.29 ms      | 2.96 ms   | 21.13 ms   | 1.76 ms    |
+| 100, 800            | 24  | 19.11 ms      | 5.30 ms   | 28.44 ms   | 2.37 ms    |
+| 500, 4000           | 64  | 19.99 ms      | 1.07 ms   | 24.15 ms   | 2.01 ms    |
+| 2000, 20000         | 56  | 20.90 ms      | 1.32 ms   | 26.78 ms   | 2.25 ms    |
+| 10000, 100000       | 112 | 26.75 ms      | 1.77 ms   | 41.31 ms   | 3.44 ms    |
+| **100000, 1000000** | 328 | 78.57 ms      | 17.00 ms  | 174.13 ms  | **14.51 ms** |
+
+> tiny–large 为 3 次中位数，big / target 为 2 次测量（两次相差 < 1%）。
+
+三点值得注意：
+
+1. **阶段数逐档与原平台完全一致**（16 / 24 / 64 / 56 / 112 / 328）。
+   同一份算法在两种差异很大的硬件上产生完全相同的阶段序列，是对"算法映射正确"
+   最强的证据（阶段数由高度函数演化决定，任何原子/同步语义的偏差都会改变它）。
+2. **目标规模（10⁵ 节点 / 10⁶ 边）TPQ = 14.51 ms**，与 NVIDIA 平台的 12.08 ms 为
+   **同一量级**（约 1.2×），说明性能瓶颈在算法与访存，而不在某一家的硬件特性上。
+3. **T\_preprocess 明显更小**（target 档 78.6 ms vs 257.9 ms）。这部分是主机端
+   `build_residual_graph` + H2D 拷贝，与 GPU 无关，差异来自云主机 CPU / 磁盘，
+   不是加速卡的优势。
+
+### 9.5 在天数平台复现
+
+```bash
+cd proj_maxflow
+COREX_HOME=/usr/local/corex-4.4.0 bash build_iluvatar.sh      # 产物 build_iluvatar/maxflow
+export LD_LIBRARY_PATH=/usr/local/corex-4.4.0/lib64:$LD_LIBRARY_PATH
+
+./build_iluvatar/maxflow selftest
+./build_iluvatar/maxflow run tests/tmp/target.csr tests/tmp/target.q /tmp/target.res --cpu-ref
+```
+
+`--cpu-ref` 会逐查询比对 GPU 与 CPU，不一致则以非零码退出，可直接当作回归测试。
 
