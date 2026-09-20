@@ -2,6 +2,7 @@
 
 > 选题：2026 夏季训练营 CUDA 方向项目阶段 · 选题四（生命序列比对）
 > 环境：WSL2 Ubuntu 22.04 + CUDA 12.2 + NVIDIA RTX 5070 Ti Laptop (12 GB)，编译目标 `sm_90`
+> 国产平台适配：沐曦 MetaX 曦云 C500 + MACA 3.5.3（见第 9 节，已实测验证，自带测试全部通过）
 > CPU 基准：32 核，OpenMP 并行
 
 ---
@@ -407,7 +408,7 @@ CPU 为 32 核 OpenMP，运行**完全相同的 seed-and-extend 算法**。
    严格做法是像 BLAST 那样基于参考规模与打分矩阵做**统计显著性（E-value）**标定。
 4. **未使用 FASTQ 质量分**（题目第 4 行的加分项）。合理做法是把质量分转成
    位置相关的错配代价，让 DP 在高质量位置更"不容忍"错配。
-5. **未做国产平台适配**（无可移植性障碍，成本较低）。
+5. **国产平台适配已完成**（沐曦 曦云 C500，见第 9 节；仅新增构建脚本，源码零改动，自带测试全部通过）。
 6. **`ncu` / `nsys` 未采集**：WSL2 不透传 CUPTI，瓶颈判断基于分阶段计时与算术量估算。
    此外本机为 sm_120、CUDA 12.2 不支持其原生编译，只能 JIT 运行 sm_90 PTX，
    首次内核启动有一次性编译开销（已在计时前预热剔除）。
@@ -487,4 +488,104 @@ IIIIIIII
 read1 chr1 0 8
 read2 chr2 0 8
 read3 unknown_origin
+```
+
+---
+
+## 9. 国产平台适配：沐曦（MetaX 曦云 C500 / MACA）
+
+### 9.1 平台环境与编译方式
+
+| 项目   | 值                                                                                |
+| ---- | -------------------------------------------------------------------------------- |
+| 加速卡  | 沐曦 曦云 C500（`mx-smi` 2.2.12，KMD 3.8.30）                                           |
+| 设备属性 | `warpSize = 64`，104 个 SM，`maxThreadsPerBlock = 1024`，共享内存 64 KB/block，计算能力 `(10,0)` |
+| 软件栈  | MACA 3.5.3.20（SDK 3.5.3.307），CUDA 兼容层由 `tools/cu-bridge` 提供                       |
+| 编译器  | `mxcc 1.0.0`（`/opt/maca/mxgpu_llvm/bin/mxcc`）                                     |
+
+本工程原本用 CMake + nvcc，沐曦平台改用 [`build_maca.sh`](build_maca.sh)：
+
+```bash
+mxcc -x maca -offload-arch native --maca-path=/opt/maca \
+     -Iinclude -I/opt/maca/tools/cu-bridge/include -L/opt/maca/lib \
+     -imacros __macro_mxcc.h -forward-unknown-to-compiler \
+     -fgpu-rdc --maca-link -lToolsExt_cu -lruntime_cu -lmcToolsExt \
+     -std=c++17 -O3 -use-fast-math \
+     src/main.cpp src/io.cpp src/cpu_ref.cpp src/cpu_seeded.cpp src/align_gpu.cu \
+     -o build_maca/seqalign
+
+export LD_LIBRARY_PATH=/opt/maca/lib
+```
+
+`tests/run_tests.sh` 固定使用 `./build/seqalign`，因此跑测试前把产物放过去即可：
+
+```bash
+mkdir -p build && cp build_maca/seqalign build/ && bash tests/run_tests.sh
+```
+
+### 9.2 移植要点：三个编译参数，**源码零改动**
+
+| 参数                                       | 作用                                                              |
+| ---------------------------------------- | --------------------------------------------------------------- |
+| `-imacros __macro_mxcc.h`                | 让 `__CUDACC__` 等 CUDA 宏在 mxcc 下生效（否则 `__host__ __device__` 宏退化，见 9.3） |
+| `-fgpu-rdc --maca-link`                  | 设备侧可分离编译与 MACA 链接阶段                                             |
+| `-lToolsExt_cu -lruntime_cu -lmcToolsExt` | cu-bridge 把 `cudaXxx` 映射为 `wcudaXxx`，实现体在 `libruntime_cu.so`，必须显式链接   |
+
+另注：fast-math 开关是 `-use-fast-math`（连字符），不是 nvcc 的 `-use_fast_math`（下划线），
+写错会被 mxcc 解析成 `-u se_fast_math` 而报 `unknown argument`。
+
+### 9.3 正确性验证：项目自带测试**全部通过**
+
+`bash tests/run_tests.sh`（MACA 产物）：
+
+| 测试组 | 内容                                                       | 结果                          |
+| --- | -------------------------------------------------------- | --------------------------- |
+| 0   | 构建                                                       | ✅ PASS                      |
+| 1   | 引擎自检（exact1/exact2/mut2/random1/random2）                 | ✅ 5/5 PASS                  |
+| 2   | GPU vs **CPU 穷举**逐行 diff，`(k,band,step)` = (11,4,4)/(13,8,8)/(15,8,8)/(15,16,12) | ✅ **4/4 完全一致（各 40/40）** |
+| 3   | 中等规模真值召回（1.6 Mbp × 2000 reads）                          | ✅ 有来源 1600/1600；随机 400/400 拒绝 |
+| 4   | 结果确定性（重复运行逐字节一致）                                         | ✅ PASS                      |
+
+第 3 组的关键统计**与英伟达平台一致**：
+
+| 指标       | 英伟达平台（§4.4）     | 沐曦 C500          |
+| -------- | ---------------- | ---------------- |
+| 起点完全一致率  | ≈ 97%（3% 不一致）   | **96.94%**       |
+| 得分完全一致率  | ≈ 89%（11% 不一致）  | **88.31%**       |
+| 随机 read 拒绝率 | 400/400          | **400/400**      |
+
+§4.4 已说明这两个比例反映的是"DP 最优解 vs 采样真值"的差异（允许空位的最优得分可以合法地
+高于理论值），并非比对错误；真正的一致性证据是第 2 组的穷举逐行 diff 与第 4 组的逐字节确定性。
+
+### 9.4 性能数据（自带测试的中等规模用例：1.6 Mbp 参考 × 2000 reads）
+
+| 阶段                  | 耗时        |
+| ------------------- | --------- |
+| T\_load（FASTA 解析）   | 4.10 ms   |
+| **T\_index**（k-mer 索引） | **28.38 ms** |
+| T\_upload           | 4.02 ms   |
+| T\_seed             | 0.62 ms   |
+| T\_verify（带状 DP）    | 1.33 ms   |
+| T\_reduce           | 0.17 ms   |
+| **T\_align**        | **6.18 ms** |
+| **T\_total**        | **38.93 ms** |
+
+索引条目 1,599,888，种子 34,000，候选对 1,660。
+
+> 与英伟达平台的可比性说明：§5.2 性能表是按**每档 20k reads** 测的，而自带回归测试用的是
+> 2000 reads，两者读段数差 10 倍，不宜直接相除。唯一可直接对照的是**索引条目同为 1.6 M** 的
+> `T_index`：英伟达 6.23 ms vs 沐曦 28.38 ms（约 **0.22×**）—— 该阶段在沐曦上主要是
+> 主机端计数排序 + H2D/D2H 搬运（见 §3.4），对 PCIe 带宽与主机 CPU 更敏感，而非纯 GPU 算力。
+> 本项目未在沐曦平台复制 10⁸ bp 的目标规模（单次生成数据约 20 s + 参考基因组内存占用较大），
+> 属于本节未覆盖的部分。
+
+### 9.5 在沐曦平台复现
+
+```bash
+cd proj_seqalign
+MACA_PATH=/opt/maca bash build_maca.sh
+export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH
+
+mkdir -p build && cp build_maca/seqalign build/
+bash tests/run_tests.sh          # 全部测试通过
 ```
