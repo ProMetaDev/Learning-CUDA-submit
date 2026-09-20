@@ -2,6 +2,7 @@
 
 > 选题：2026 夏季训练营 CUDA 方向项目阶段 · 选题九
 > 环境：WSL2 Ubuntu 22.04 + CUDA 12.2 + NVIDIA RTX 5070 Ti Laptop (12 GB)，编译目标 `sm_90`
+> 国产平台适配：沐曦 MetaX 曦云 C500 + MACA 3.5.3（见第 9 节，已实测验证，13/13 通过）
 > CPU 参考实现使用 OpenMP 并行
 
 ---
@@ -285,7 +286,10 @@ n=200000, dim=128, nq=500, nlist=256：
    （cosine 已通过归一化等价转换），或使用专门的量化器。
 3. **nlist 上限受共享内存约束**（需在共享内存中存放 nlist 个距离，nlist ≲ 12288）。
    更大 nlist 需改为不落共享内存的分块选择。
-4. **未做国产平台适配**（无架构特性依赖，移植成本较低）。
+4. **国产平台已适配沐曦 曦云 C500**（见第 9 节）：自带测试 13/13 通过，
+   精确检索 top-K 集合与 CPU 参考一致、IVF recall@10 = 1.0。
+   本工程含较多 `__shfl_xor_sync`（`width=32` / `nlist` 级 mask）归约，
+   而在 `warpSize = 64` 的沐曦平台上实测语义正确。
 5. **`ncu` / `nsys` 未采集**：WSL2 不透传 CUPTI（实测 ncu 报 "No kernels were profiled"、
    nsys 报告中 CUDA kernel 段为空），因此本报告的瓶颈判断来自访存量估算与实测
    时间吻合，而非 profiler 计数器；如需补齐该加分项，需在原生 Linux / AutoDL 上运行。
@@ -318,4 +322,112 @@ bash tests/run_tests.sh                        # 端到端测试（13 项）
                 configs/ivf_k10.cfg outputs/results/ivf --gt outputs/gt/exact.result
 ./build/vs bench  outputs/data/base.txt outputs/data/q.txt outputs/index/ivf.bin \
                 configs/ivf_k10.cfg outputs/results/bench --gt outputs/gt/exact.result
+```
+
+---
+
+## 9. 国产平台适配：沐曦（MetaX 曦云 C500 / MACA）
+
+### 9.1 平台环境与编译方式
+
+| 项目   | 值                                                                                |
+| ---- | -------------------------------------------------------------------------------- |
+| 加速卡  | 沐曦 曦云 C500（`mx-smi` 2.2.12，KMD 3.8.30）                                           |
+| 设备属性 | `warpSize = 64`，104 个 SM，`maxThreadsPerBlock = 1024`，共享内存 64 KB/block，计算能力 `(10,0)` |
+| 软件栈  | MACA 3.5.3.20（SDK 3.5.3.307），CUDA 兼容层由 `tools/cu-bridge` 提供                       |
+| 编译器  | `mxcc 1.0.0`（`/opt/maca/mxgpu_llvm/bin/mxcc`）                                     |
+
+构建脚本 [`build_maca.sh`](build_maca.sh)：
+
+```bash
+mxcc -x maca -offload-arch native --maca-path=/opt/maca \
+     -Iinclude -I/opt/maca/tools/cu-bridge/include -L/opt/maca/lib \
+     -imacros __macro_mxcc.h -forward-unknown-to-compiler \
+     -fgpu-rdc --maca-link -lToolsExt_cu -lruntime_cu -lmcToolsExt \
+     -std=c++17 -O3 \
+     src/main.cpp src/io.cpp src/metrics.cpp src/cpu_ref.cpp src/exact.cu src/ivf.cu \
+     -o build_maca/vs
+
+export LD_LIBRARY_PATH=/opt/maca/lib
+BIN=./build_maca/vs bash tests/run_tests.sh
+```
+
+### 9.2 重点验证：`warpSize = 64` 上的 shuffle 归约（本工程的核心风险）
+
+本工程大量使用 warp 级归约（§3.3 专门记录过 mask 与参与线程不匹配的 UB 问题）：
+
+| 位置                              | 用法                                              |
+| ------------------------------- | ----------------------------------------------- |
+| `include/topk_merge.cuh:56,57`  | `__shfl_xor_sync(0xffffffffu, v, off, 32)`（warp 内 top-K） |
+| `include/topk_merge.cuh:78,87`  | `__shfl_xor_sync(kMask, v, off, NWARP)`，`kMask = (1<<NWARP)-1`（跨 warp 合并） |
+| `src/ivf.cu:200,201,217,218`    | `__shfl_xor_sync(..., 32)` 与 `(..., NWARP)`      |
+
+沐曦的 `warpSize` 是 **64 而不是 32**，这些"逻辑 32 线程组"的假设属于必须实测的点。
+实测结论：**全部语义正确**（见 9.3 的第 2、5 组断言 —— 精确检索与 CPU 参考逐名次一致、
+IVF recall@10 = 1.0）。源码零改动。
+
+### 9.3 正确性验证：自带测试 13/13 通过
+
+`BIN=./build_maca/vs bash tests/run_tests.sh`：
+
+| 组   | 内容                                                         | 结果       |
+| --- | ---------------------------------------------------------- | -------- |
+| 0   | 引擎自检                                                       | ✅ PASS   |
+| 1   | 生成 clustered 数据（n=20000, dim=128, nq=200, nlist=64）        | ✅ PASS   |
+| 2   | 精确检索 K ∈ {1,10,50,100}，GPU vs CPU **逐名次一致**              | ✅ 4/4    |
+| 3   | IVF 倒排表是 0..n-1 的合法排列                                      | ✅ PASS   |
+| 4   | nprobe 扫描：recall 随 nprobe 单调不降、nprobe=nlist 时 = 1.0       | ✅ PASS   |
+| 5   | 三种度量（L2 / inner_product / cosine）精确检索与 CPU 一致             | ✅ 3/3    |
+| —   | **合计**                                                     | **13/13** |
+
+目标规模（n=10⁶, dim=128, nq=1000）的正确性同样通过：
+
+```
+[正确性验证] (GPU 精确 vs CPU 参考)
+id 集合不一致的 query 数: 0 / 1000
+逐名次 id 不一致: 0 / 10000
+```
+
+### 9.4 性能对照（n=10⁶, dim=128, nq=1000, top_k=10, 聚类数据）
+
+| 方案                                | 指标      | NVIDIA RTX 5070 Ti | 沐曦 C500      |
+| --------------------------------- | ------- | ------------------ | ------------ |
+| **精确检索**                          | 总时间     | 339.74 ms          | 1454.35 ms   |
+|                                   | QPS     | 2943               | 687.6        |
+|                                   | P50 / P99 | 26.55 / 26.67 ms   | 76.63 / 81.01 ms |
+| **IVF-Flat**（nlist=1024, nprobe=16） | 总时间     | 141.06 ms          | 195.51 ms    |
+|                                   | QPS     | 7089               | **5114.9**   |
+|                                   | P50 / P99 | 4.67 / 5.37 ms     | 6.07 / 7.08 ms |
+|                                   | recall@10 | 1.0000             | **1.0000**   |
+|                                   | 扫描比例    | 6.79%              | 6.83%        |
+| **IVF 建索引**                       | 耗时      | 178.43 ms          | 405.82 ms    |
+
+**读法**：
+
+1. **IVF 路径差距不大**（195.5 vs 141.1 ms，约 **0.72×**），且 `recall@10 = 1.0`、
+   扫描比例几乎相同（6.83% vs 6.79%）—— 说明索引构建与倒排扫描的**行为一致**。
+2. **精确检索差距较大**（1454 vs 340 ms，约 **0.23×**）。
+   精确检索是 `nq × n × dim` 的纯计算路径（1000 × 10⁶ × 128 ≈ 1.3×10¹¹ 次乘加），
+   更吃 FMA 吞吐，这是沐曦 C500 与英伟达笔记本卡差距最明显的一处。
+3. **本表未列"相对 CPU 加速比"**：沐曦容器的主机 CPU 与笔记本完全不同
+   （同一 CPU 参考实现：89 514 ms vs 5878 ms，相差 **15 倍**，说明容器分配的核数远少于
+   本机 32 核），两台的 CPU/GPU 比值不可直接相除。C500 上的 CPU 精确检索为 89.5 s，
+   GPU 精确检索 1.45 s，**加速 61.6×**（该数字仅在同一台机器内部有意义）。
+
+### 9.5 在沐曦平台复现
+
+```bash
+cd proj_vecsearch
+MACA_PATH=/opt/maca bash build_maca.sh
+export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH
+
+BIN=./build_maca/vs bash tests/run_tests.sh      # 13/13
+
+# 目标规模
+./build_maca/vs gen clustered 1000000 128 outputs/data/base.txt --nlist 1024 --seed 7
+./build_maca/vs genq outputs/data/base.txt 1000 outputs/data/q.txt --kind clustered
+./build_maca/vs exact outputs/data/base.txt outputs/data/q.txt configs/exact_k10.cfg outputs/gt/exact
+./build_maca/vs build outputs/data/base.txt configs/ivf_k10.cfg outputs/index/ivf.bin
+./build_maca/vs search outputs/data/base.txt outputs/data/q.txt outputs/index/ivf.bin \
+                 configs/ivf_k10.cfg outputs/results/ivf --gt outputs/gt/exact.result
 ```
