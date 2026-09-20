@@ -4,6 +4,7 @@
 > 硬件：NVIDIA GeForce RTX 5070 Ti Laptop GPU（12 GB，sm_120）
 > 软件：CUDA 12.2（编译目标 sm_90 SASS + compute_90 PTX，由驱动 JIT 在 sm_120 上运行）、
 > g++ 9.4、OpenCV 4.2.0、WSL2 (Ubuntu 20.04)
+> 国产平台适配：沐曦 MetaX 曦云 C500 + MACA 3.5.3 + OpenCV 4.5.4（见第 9 节，已实测验证，自带测试全部通过）
 
 ---
 
@@ -374,7 +375,10 @@ CPU 参考实现是**同一份语义的朴素三重循环**（`O(S²·P²)`，Op
 
 **当前局限**
 
-1. **未做国产平台适配**（题目提到"每适配一款国产平台额外加分"）：本机无相关硬件与工具链。
+1. **国产平台已完成适配**：沐曦 曦云 C500 + MACA 3.5.3（见第 9 节）。
+   自带测试全部通过，GPU 与 CPU 参考 `MAE=0.0000`（逐像素一致）。
+   本工程原本强依赖 OpenCV（图像读写 + `fastNlMeansDenoising*` 参考），
+   沐曦容器里同样通过 `apt` 装了 OpenCV 4.5.4，因此**源码零改动**。
 2. **未采集 `ncu` / `nsys` 数据**（题目列为加分项）：本机为 WSL2，不透传 CUPTI
    （此前项目实测 `nsys` 的 CUDA kernel 段为空），且 sm_120 只能 JIT 运行 sm_90 PTX，
    剖析器无法给出有意义的指令级指标。
@@ -436,3 +440,128 @@ sigma = 25.0                  # 噪声标准差估计，对于8位图像范围0-
 
 输出：① 与输入同格式的降噪图；② 性能日志（`--perf` 指定路径，追加写），每行包含
 分辨率/通道/全部参数、`gpu`/`kernel` 耗时、吞吐（MPix/s）、以及 CPU / OpenCV 的耗时与加速比。
+
+---
+
+## 9. 国产平台适配：沐曦（MetaX 曦云 C500 / MACA）
+
+本工程是全部 8 个选题里**唯一强依赖第三方计算机视觉库**的一个（OpenCV 既做图像读写，
+又提供 `fastNlMeansDenoising*` 作为外部参考）。它在沐曦平台上的适配过程，
+本质上就是"把 OpenCV 补上"。
+
+### 9.1 平台环境与依赖
+
+| 项目    | 值                                                                                |
+| ----- | -------------------------------------------------------------------------------- |
+| 加速卡   | 沐曦 曦云 C500（`mx-smi` 2.2.12，KMD 3.8.30）                                           |
+| 设备属性  | `warpSize = 64`，104 个 SM，`maxThreadsPerBlock = 1024`，共享内存 64 KB/block，计算能力 `(10,0)` |
+| 软件栈   | MACA 3.5.3.20（SDK 3.5.3.307），CUDA 兼容层由 `tools/cu-bridge` 提供                       |
+| 编译器   | `mxcc 1.0.0`（`/opt/maca/mxgpu_llvm/bin/mxcc`）                                     |
+| 第三方依赖 | **OpenCV 4.5.4**（apt 安装）+ numpy 1.21.5 + Pillow 9.0.1（供 `tools/gen_image.py` 与 PSNR 计算） |
+| 容器    | Ubuntu 22.04 + Python 3.10                                                       |
+
+**关键一步：沐曦容器初始没有 OpenCV**，但它的 apt 源是可达的
+（`archive.ubuntu.com` 返回 200，耗时 0.7 s），所以直接装即可：
+
+```bash
+apt-get update -qq
+apt-get install -y --no-install-recommends libopencv-dev python3-numpy python3-pil
+# 验证：pkg-config --modversion opencv4 → 4.5.4
+```
+
+依赖补齐后，**本工程在沐曦上同样是源码零改动**（只新增构建脚本），
+`--opencv` 参考对比也照常可跑。
+
+### 9.2 编译方式
+
+构建脚本 [`build_maca.sh`](build_maca.sh)，OpenCV 的头文件与库参数由 `pkg-config` 自动取，
+不写死路径：
+
+```bash
+OCV_CFLAGS="$(pkg-config --cflags opencv4)"
+OCV_LIBS="$(pkg-config --libs opencv4)"
+
+mxcc -x maca -offload-arch native --maca-path=/opt/maca \
+     -Iinclude -I/opt/maca/tools/cu-bridge/include -L/opt/maca/lib \
+     $OCV_CFLAGS \
+     -imacros __macro_mxcc.h -forward-unknown-to-compiler \
+     -fgpu-rdc --maca-link -lToolsExt_cu -lruntime_cu -lmcToolsExt \
+     -std=c++17 -O3 \
+     src/main.cpp src/image_io.cpp src/cpu_ref.cpp src/nlm_gpu.cu \
+     $OCV_LIBS -o build_maca/nlm
+
+export LD_LIBRARY_PATH=/opt/maca/lib
+```
+
+> 本工程**不加 `-use-fast-math`**，与本工程 CMake 的 nvcc 默认行为保持一致：
+> 测试里有 `MAE < 0.05`、`PSNR 提升 > 8 dB` 这类阈值判定，不宜再引入快速数学近似
+> （这一点在先做的选题二上吃过亏，见该题报告 12.2）。
+
+`tests/run_tests.sh` 固定使用 `./build/nlm`，先 `mkdir -p build && cp build_maca/nlm build/` 再跑。
+
+### 9.3 正确性验证：自带测试**全部通过**
+
+| 组   | 内容                                       | 结果                                    |
+| --- | ---------------------------------------- | ------------------------------------- |
+| 0   | selftest                                 | ✅ PASS（`GPU vs CPU 参考: MAE=0.0000 PSNR=99.00 dB max=0`） |
+| 2   | GPU 与 CPU 参考实现一致性（gray256 / rgb384）      | ✅ 两项均 `MAE=0.0000`                    |
+| 3   | 降噪有效性（相对无噪真值）                            | ✅ PSNR **20.19 → 33.70 dB**（提升 13.5 dB） |
+| 4   | 近似开关的误差与加速                               | ✅ 4/4（见下表）                            |
+| 5   | 参数校验（`patch_radius=0` / `h=-1` / 图不存在）    | ✅ 3/3                                 |
+| 6   | 结果确定性（重复运行逐字节一致）                         | ✅ PASS                                |
+| —   | **合计**                                   | **全部测试通过 ✓**                          |
+
+第 4 组（1080p RGB，`exact.txt` 参数）实测：
+
+| 模式            | GPU ms | MAE vs exact | PSNR vs 真值 | 判定                          |
+| ------------- | ------ | ------------ | ---------- | --------------------------- |
+| exact         | 5.76   | 0.0000       | 33.70      | 基准                          |
+| search_step2  | 3.51   | 2.3202       | 31.86      | ✅ 未变慢且仍有效降噪                 |
+| patch_step2   | 5.50   | 2.8682       | 29.87      | ✅ 仍有效降噪                     |
+| lut2048       | 5.94   | 0.0621       | 33.74      | ✅ 近乎无损（与 §3.4 的 MAE≈0.06 吻合） |
+
+**GPU 与 CPU 参考实现逐像素一致（MAE=0.0000）**，说明浮点权重计算、位移累加顺序、
+`h²` 归一化等环节在沐曦平台上与英伟达平台行为一致。
+
+### 9.4 性能对照（1920×1080 RGB，σ=25，与 §5.2 同口径）
+
+| 参数档              | 平台                 | GPU 总 ms     | 内核 ms       | 吞吐 MPix/s  | PSNR vs 真值 |
+| ---------------- | ------------------ | ----------- | ----------- | ---------- | --------- |
+| exact            | NVIDIA（热稳态）        | 70.50       | 54.21       | 29.4       | 38.00     |
+| exact            | NVIDIA（冷态）         | 43.51       | 28.49       | 47.7       | 38.00     |
+| **exact**        | **沐曦 C500**         | **53.4–54.5** | **34.1–34.2** | **38.1–38.8** | **38.21** |
+| high\_quality    | 沐曦 C500            | 110.7–118.8 | 93.5–94.9   | 17.5–18.7  | 38.58     |
+| realtime\_preview | 沐曦 C500            | 32.1–34.2   | 11.7–11.8   | 60.7–64.5  | 35.48     |
+
+两点读法：
+
+1. **沐曦的 exact 档吞吐（38.8 MPix/s）正好落在英伟达本机"冷态 47.7 / 热稳态 29.4"
+   的区间内**，且 PSNR 38.21 与 38.00 基本一致 —— 可以说两者在同一水平。
+   注意 §3.6 记录过本机仅因散热就有 1.6 倍波动，所以跨平台比到这个精度已经足够。
+2. **不要跨机比较"加速比"列**：沐曦容器上 OpenCV 的 `fastNlMeansDenoising` 耗时
+   2077–2674 ms（exact 档），是本机 439–539 ms 的约 5 倍 —— 因为分母是主机 CPU，
+   而容器分配的核数远少于本机 32 线程（§5.6 那张 CPU 参考表同理不可跨机搬）。
+   因此本表只列 GPU 侧耗时与 PSNR，不列加速比。
+3. `realtime_preview` 档在 C500 上 32–34 ms/帧 ≈ **30 FPS**，1080p 达到交互式实时。
+
+### 9.5 在沐曦平台复现
+
+```bash
+# 1) 依赖
+apt-get update -qq && apt-get install -y --no-install-recommends \
+    libopencv-dev python3-numpy python3-pil
+
+# 2) 构建
+cd proj_nlm
+MACA_PATH=/opt/maca bash build_maca.sh
+export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH
+
+# 3) 测试（全部通过）
+mkdir -p build && cp build_maca/nlm build/
+bash tests/run_tests.sh
+
+# 4) 性能
+python3 tools/gen_image.py --size 1920x1080 --channels 3 --sigma 25 --seed 21 \
+    --out-clean /tmp/c.png --out-noisy /tmp/n.png
+./build_maca/nlm denoise /tmp/n.png params/exact.txt /tmp/o.png --opencv --ref /tmp/c.png
+```
