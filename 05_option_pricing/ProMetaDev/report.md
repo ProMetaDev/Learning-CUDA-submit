@@ -2,6 +2,7 @@
 
 > 选题：2026 夏季训练营 CUDA 方向项目阶段 · 选题五（金融衍生品定价与风险估计）
 > 环境：WSL2 Ubuntu 20.04 + CUDA 12.2 + NVIDIA RTX 5070 Ti Laptop (12 GB)，编译目标 `sm_90`（Blackwell sm_120 由 PTX JIT 运行）
+> 国产平台适配：沐曦 MetaX 曦云 C500 + MACA 3.5.3（见第 10 节，已实测验证，8/8 通过）
 > CPU 基准：Intel i9-14900HX，WSL2 单线程
 
 ---
@@ -288,8 +289,10 @@ GPU 信息（型号 / SM 数 / CC / 显存 / CUDA 版本 / 驱动版本）、期
 
 **本次实现的局限**：
 
-1. **未做国产平台适配**（题目提到每适配一款国产平台可额外加分）。代码只依赖 CUDA Runtime 与 cuRAND，
-   迁移到国产平台主要工作量在随机数发生器与归约原语的替换。
+1. **国产平台适配已完成**：沐曦 曦云 C500 + MACA 3.5.3（见第 10 节）。
+   本报告原先预判"迁移到国产平台主要工作量在随机数发生器与归约原语的替换"——
+   实测**只命中了前半句**：cuRAND → mcRAND 是唯一需要改的地方（且只是编译参数层面），
+   归约原语无需改动，**源码零改动**，自带测试 8/8 通过。
 2. **未采集 `ncu` / `nsys` 数据**（题目列为加分项）。原因有二：
    ① 本机为 WSL2，实测不透传 CUPTI（`nsys` 报告中 CUDA kernel 段为空）；
    ② 本机 GPU 为 sm_120，而 CUDA 12.2 不支持其原生编译，只能 JIT 运行 sm_90 PTX，
@@ -311,7 +314,7 @@ GPU 信息（型号 / SM 数 / CC / 显存 / CUDA 版本 / 驱动版本）、期
 4. **连续性修正**：实现 BGK 修正以消除离散监控与连续解析价之间的系统偏差。
 5. **批次 Greeks**：当前有限差分需要多次重跑（每次 11~14 ms），可把 5 个希腊字母的 bump
    合并成一个 kernel 批次，减少路径重复生成。
-6. **补齐 profiler 与国产平台适配**（如需冲刺加分项）。
+6. **补齐 profiler 采集**（`ncu`/`nsys`，如需冲刺加分项）。
 
 ---
 
@@ -389,6 +392,119 @@ ASIAN_CALL,5.28272058,5.08647886,0.19624173,0.00020878,0.00040920,1.63570000,580
 **性能日志**（`outputs/perf.log`，追加式）：
 
 ```
-# GPU=NVIDIA GeForce RTX 5070 Ti Laptop GPU  SMs=46  CC=12.0  VRAM=12226MB  CUDA_RT=12.2  DRV=13.3 | MC+CV(geometric asian)
+# GPU=NVIDIA GeForce RTX 5070 Ti Laptop GPU  SMs=46  CC=12.0  VRAM=12226MB CUDA_RT=12.2  DRV=13.3 | MC+CV(geometric asian)
 [ASIAN_CALL] paths=1000000 steps=256 seed=42 vr=2 | price=5.2831 ref=5.0865 SE=0.0002 | gpu=1.6357ms cpu=5801.0771ms pps=611354555.7881 speedup=3546.5149 occupancy=50.0000% Delta=0.5614 Gamma=0.0334 Vega=22.3171 Theta=-2.9366 Rho=23.4953
+```
+
+---
+
+## 10. 国产平台适配：沐曦（MetaX 曦云 C500 / MACA）
+
+### 10.1 平台环境与编译方式
+
+| 项目   | 值                                                                                |
+| ---- | -------------------------------------------------------------------------------- |
+| 加速卡  | 沐曦 曦云 C500（`mx-smi` 2.2.12，KMD 3.8.30）                                           |
+| 设备属性 | `warpSize = 64`，104 个 SM，`maxThreadsPerBlock = 1024`，共享内存 64 KB/block，计算能力 `(10,0)` |
+| 软件栈  | MACA 3.5.3.20（SDK 3.5.3.307），CUDA 兼容层由 `tools/cu-bridge` 提供                       |
+| 编译器  | `mxcc 1.0.0`（`/opt/maca/mxgpu_llvm/bin/mxcc`）                                     |
+
+构建脚本 [`build_maca.sh`](build_maca.sh)：
+
+```bash
+mxcc -x maca -offload-arch native --maca-path=/opt/maca \
+     -Iinclude -I/opt/maca/tools/cu-bridge/include -I/opt/maca/include/mcrand -L/opt/maca/lib \
+     -imacros __macro_mxcc.h -forward-unknown-to-compiler \
+     -fgpu-rdc --maca-link -lToolsExt_cu -lruntime_cu -lmcToolsExt \
+     -lmcrand \
+     -std=c++17 -O3 -use-fast-math \
+     src/main.cpp src/bs_formula.cpp src/file_io.cpp src/pricing_kernels.cu \
+     -o build_maca/cuda_pricing
+
+export LD_LIBRARY_PATH=/opt/maca/lib
+```
+
+> `tests/run_tests.sh` 固定使用 `./build/cuda_pricing`，因此先
+> `mkdir -p build && cp build_maca/cuda_pricing build/` 再跑。
+
+### 10.2 移植中唯一要改的地方：cuRAND → mcRAND（**源码零改动**）
+
+先按通用配方编译（只加 cu-bridge 头文件与链接参数），报错：
+
+```
+In file included from src/pricing_kernels.cu:12:
+In file included from /opt/maca/tools/cu-bridge/include/curand_kernel.h:3:
+/opt/maca/tools/cu-bridge/include/bridge/rand/curand_kernel_wrapper.h:9:10:
+      fatal error: 'mcrand_kernel.h' file not found
+```
+
+原因：cu-bridge 的 `curand_kernel.h` 只是个转发壳，真正内容在沐曦自己的
+`mcrand` 库里（`/opt/maca/include/mcrand/mcrand_kernel.h`），
+而该目录不在默认 include 路径上。**正解就写在同一份 `cu-bridge/bin/conf.json` 里**
+（也就是沐曦自己给 `-lcurand` 配的替换规则）：
+
+```
+"-lcurand"                        →  "-lmcrand"
+                                  →  "-I ${MACA_PATH}/include/mcrand"
+```
+
+补上 `-I$MACA/include/mcrand` 与 `-lmcrand` 后一次编译通过。
+
+值得记一笔：§8 原先预判"迁移到国产平台主要工作量在**随机数发生器**与**归约原语**的替换"——
+实测**只命中前半句**：随机数发生器确实要处理（但只在编译参数层面），
+**归约原语完全不需要改**（本平台的 64 位原子与 shuffle 语义均正确），因此源码一行未动。
+
+### 10.3 正确性验证：自带测试 8/8 通过
+
+`bash tests/run_tests.sh`：
+
+| 断言                                              | 结果     |
+| ----------------------------------------------- | ------ |
+| 构建成功                                            | ✅ PASS |
+| 题目格式键名被正确解析（未静默回落到默认值）                          | ✅ PASS |
+| 带引号的小写枚举 `variance_reduction="antithetic"` 被识别 | ✅ PASS |
+| 未识别键名有告警                                        | ✅ PASS |
+| 缺失文件明确报错并返回非零退出码（rc=1）                          | ✅ PASS |
+| 非法 `option_type` 明确报错                            | ✅ PASS |
+| 矛盾障碍配置明确报错（避免静默输出 price=0/err=0 的假完美结果）          | ✅ PASS |
+| 六类期权定价回归                                        | ✅ PASS |
+
+**可复现性**：同一 seed 连跑 3 次，`price` 完全一致（`5.2827`，SE=0.000209063），
+与 §5.3 的"同 seed 逐位一致"一致。
+
+**设备侧 FP64 已验证可用**：本工程在设备侧使用 `__constant__` 中的 `double` 参数
+与 FP64 定价公式，而沐曦 C500 的 FP64 实测正确（见探测结论），因此**无需降精度改写**。
+
+### 10.4 性能对照（ASIAN_CALL + 控制变量法，steps=256）
+
+| 路径数  | 平台                 | GPU 时间       | 吞吐 (paths/s)  | occupancy |
+| ---- | ------------------ | ----------- | ------------- | --------- |
+| 1 M  | NVIDIA RTX 5070 Ti | **1.64 ms** | 6.11 × 10⁸    | 50%       |
+| 1 M  | **沐曦 C500**        | 2.71 ms     | 3.69 × 10⁸    | **75%**   |
+| 10 M | **沐曦 C500**        | 19.78 ms    | 5.06 × 10⁸    | 75%       |
+
+- **1 M 路径下约为英伟达笔记本卡的 0.60×**，但 **occupancy 更高（75% vs 50%）**，
+  且吞吐随规模上升（3.69 → 5.06 × 10⁸ paths/s）—— 说明固定开销占比更小、
+  大 batch 下更能吃满；小规模档的差距主要来自单卡绝对算力与时钟。
+- **定价数值**：C500 上 1 M 路径 `price = 5.2827`，英伟达参考为 `5.2831`，
+  差 0.0004 ≈ 2×SE —— 这是 **mcRAND 与 cuRAND 的随机序列不同**导致的蒙特卡洛估计差异，
+  不是实现错误（同一平台内同 seed 完全可复现，见 10.3）。
+- **未列"相对 CPU 加速比"**：C500 容器的主机 CPU 单线程跑 10 M 路径耗时 **376.5 s**
+  （笔记本 i9 跑 1 M 为 5.8 s），两台机器的 CPU 不在同一量级，比值不可直接相除。
+  C500 上 10 M 路径 GPU 19.78 ms vs 同机 CPU 376.5 s，**同机加速比约 1.9 × 10⁴×**。
+
+### 10.5 在沐曦平台复现
+
+```bash
+cd proj_pricing
+MACA_PATH=/opt/maca bash build_maca.sh
+export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH
+
+mkdir -p build && cp build_maca/cuda_pricing build/
+bash tests/run_tests.sh          # 8/8
+
+# 性能（1M / 10M 路径）
+./build_maca/cuda_pricing params/option_params.txt params/sim_params.txt outputs/r.json --no-cpu
+sed 's/^num_paths.*/num_paths         = 1000000/' params/sim_params.txt > /tmp/sim1m.txt
+./build_maca/cuda_pricing params/option_params.txt /tmp/sim1m.txt outputs/r1m.json --no-cpu
 ```
