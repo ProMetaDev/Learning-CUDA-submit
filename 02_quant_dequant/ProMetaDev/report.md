@@ -3,6 +3,7 @@
 > 选题：2026 夏季训练营 CUDA 方向项目阶段 · 选题二
 > 环境：WSL2 Ubuntu 22.04 + CUDA 12.2 + NVIDIA RTX 5070 Ti Laptop (12 GB，驱动报告 compute capability 12.0)
 > 编译目标 `sm_90`；代码格式化 clang-format 23.1.1；交叉验证 ml_dtypes 0.6.0
+> 国产平台适配：沐曦 MetaX 曦云 C500 + MACA 3.5.3（见第 12 节，已实测验证，36/36 通过）
 
 ---
 
@@ -394,7 +395,9 @@ Tensor Core 指令，**未要求**任何 Ampere 以上的架构特性。代码�
    nsys 报告中 CUDA kernel 段为空 —— WSL2 不透传 CUPTI。因此本报告的 ALU/访存
    瓶颈判断来自**指令量与吞吐的理论估算 + 实测时间吻合**，而非 profiler 计数器。
    若要补齐 `ncu`/`nsys` 分析（题目加分项），需在原生 Linux、训练营服务器或 AutoDL 上运行。
-2. 未做国产平台（天数 / 沐曦）适配；代码已无架构特性依赖，移植成本较低。
+2. 国产平台已适配沐曦 曦云 C500（见第 12 节）：自带测试 36/36 通过，
+   全部可比较项均为 CPU=GPU **逐位一致**。移植中唯一的数值陷阱是 **必须关闭
+   `-use-fast-math`**（否则 nvfp4 block 模式在临界块上出现 1 ULP 级偏差）。
 
 **技术优化方向**：
 
@@ -427,3 +430,124 @@ python3 tools/cross_check.py <tensor> <quant>   # 单独运行第三方交叉验
 
 参考输出见 `outputs/`（`.log` 为误差与性能日志，`.quant` 为低精度权重文件，
 `.dequant.bin` 为反量化张量）。
+
+---
+
+## 12. 国产平台适配：沐曦（MetaX 曦云 C500 / MACA）
+
+本工程对数值正确性的要求最高（每个配置都要"CPU 参考 vs GPU 逐位一致"），
+因此这次适配的最大收获不是"跑起来"，而是**发现了 fast-math 会破坏逐位一致性**。
+
+### 12.1 平台环境与编译方式
+
+| 项目   | 值                                                                                |
+| ---- | -------------------------------------------------------------------------------- |
+| 加速卡  | 沐曦 曦云 C500（`mx-smi` 2.2.12，KMD 3.8.30）                                           |
+| 设备属性 | `warpSize = 64`，104 个 SM，`maxThreadsPerBlock = 1024`，共享内存 64 KB/block，计算能力 `(10,0)` |
+| 软件栈  | MACA 3.5.3.20（SDK 3.5.3.307），CUDA 兼容层由 `tools/cu-bridge` 提供                       |
+| 编译器  | `mxcc 1.0.0`（`/opt/maca/mxgpu_llvm/bin/mxcc`）                                     |
+
+构建脚本 [`build_maca.sh`](build_maca.sh)：
+
+```bash
+mxcc -x maca -offload-arch native --maca-path=/opt/maca \
+     -Iinclude -I/opt/maca/tools/cu-bridge/include -L/opt/maca/lib \
+     -imacros __macro_mxcc.h -forward-unknown-to-compiler \
+     -fgpu-rdc --maca-link -lToolsExt_cu -lruntime_cu -lmcToolsExt \
+     -std=c++17 -O3 \
+     src/main.cpp src/io.cpp src/metrics.cpp src/reference.cpp src/kernels.cu \
+     -o build_maca/lowprec
+
+export LD_LIBRARY_PATH=/opt/maca/lib
+BIN=./build_maca/lowprec bash tests/run_tests.sh
+```
+
+### 12.2 移植中唯一的数值陷阱：**必须关掉 `-use-fast-math`**
+
+本工程的其它几个选题在沐曦上都开了 `-use-fast-math`（收益 15% 左右），但**本工程不能开**。
+
+**现象**：开启 fast-math 后，`nvfp4_block_*` 配置在 **2048×2048 的 random 数据**上出现：
+
+```
+CPU 参考 vs GPU: 存在差异 (mismatch=16, max_diff=0.262)
+```
+
+**定位**：
+
+1. 不一致的元素数**恰好是 16，正好等于 NVFP4 的一个 block**（`block_size = 16`）——
+   说明是**某一个块的缩放因子**推导出了不同的结果，而不是逐元素误差；
+2. 只有 `nvfp4_block`（块级缩放）受影响，`nvfp4_tensor`（张量级缩放）与 `mxfp8_block`
+   都是逐位一致；`normal`/`outlier` 分布也一致，只有 `random` 触发；
+3. 形状依赖：2048×1024 / 1024×2048 / 1536×1536 全部逐位一致，只有 2048×2048 命中这个临界块。
+
+结论：这是**块缩放推导在临界点上的一处 1 ULP 级舍入差异**，被 `-use-fast-math`
+（更快但精度更松的数学函数近似）放大成了可见的不一致。
+
+**修复**：构建时不加 `-use-fast-math`（与 nvcc 默认行为对齐）。改后：
+
+```
+CPU 参考 vs GPU: 逐位一致 (mismatch=0, max_diff=0)
+PASS=36  FAIL=0   全部通过
+```
+
+> 一般的经验：**涉及"逐位一致"验收的数值工程，不要开 fast-math**；
+> 只有在做性能基准、且验收标准是误差上界时才适合打开。
+
+### 12.3 正确性验证：自带测试 36/36 通过
+
+`BIN=./build_maca/lowprec bash tests/run_tests.sh`：
+
+| 组   | 内容                                        | 结果                     |
+| --- | ----------------------------------------- | ---------------------- |
+| 0   | 编解码自检（E4M3/E5M2/E2M1/E8M0）                | ✅ 15/15                |
+| 1   | fp32 输入 × 8 组配置 × 3 种分布（random/normal/outlier） | ✅ 24/24                |
+| 2   | fp16 输入路径                                 | ✅ PASS                 |
+| 3   | 权重文件重载反量化                                 | ✅ PASS                 |
+| 4   | 第三方标准实现（ml_dtypes）交叉验证                     | ⏭ 跳过（容器未装 ml_dtypes） |
+| 5   | 边界与鲁棒性（非整除元素数 / 非标准 block_size / 全零 / 1×1） | ✅ 10/10                |
+| —   | **合计（不含跳过的第 4 组）**                        | **PASS=36 FAIL=0**     |
+
+汇总表里 **35 项 `CPU=GPU` 全部为"逐位一致"**（其余为随机舍入配置，本身不适用逐位比较）。
+
+**warpSize = 64 的风险点已验证通过**：本工程在 BLOCK 模式用
+`__shfl_xor_sync(0xffffffffu, v, off, WIDTH)`（`WIDTH ≤ 32`）做块内 amax 规约，
+而沐曦的 `warpSize` 是 64。实测所有配置的 GPU 结果与 CPU 参考**逐位一致**，
+说明该段内规约在这个平台上语义正确。
+
+### 12.4 性能对照（4096×4096 = 16.78M 元素，输入 64 MiB fp32）
+
+| 配置                    | 平台         | 量化带宽      | 反量化带宽      | 重载反量化   |
+| --------------------- | ---------- | --------- | ---------- | ------- |
+| MXFP8 block E4M3 →fp16 | NVIDIA 5070 Ti | 35.1 GB/s | 279.4 GB/s | —       |
+|                       | **沐曦 C500** | 35.6 GB/s | 272.9 GB/s | 0.21 ms |
+| MXFP8 tensor E4M3 →fp16 | NVIDIA 5070 Ti | 38.2 GB/s | 265.0 GB/s | —       |
+|                       | **沐曦 C500** | **77.3 GB/s** | 148.5 GB/s | 0.36 ms |
+| NVFP4 block →fp16      | NVIDIA 5070 Ti | 34.2 GB/s | 150.7 GB/s | —       |
+|                       | **沐曦 C500** | **50.9 GB/s** | **27.5 GB/s** | 1.50 ms |
+| NVFP4 block →fp32      | NVIDIA 5070 Ti | 32.6 GB/s | 174.3 GB/s | —       |
+|                       | **沐曦 C500** | 50.6 GB/s | **8.1 GB/s** | 9.39 ms |
+
+**读法**：
+
+1. **量化（ALU 受限）在沐曦上更快**：MXFP8 tensor 77.3 vs 38.2 GB/s（约 2×），
+   说明该平台的整数/位运算吞吐对这类软件编解码更有利。
+2. **反量化（带宽受限）MXFP8 基本持平**（272.9 vs 279.4 GB/s），
+   但 **NVFP4 反量化明显偏慢**（fp16：27.5 vs 150.7 GB/s；fp32：8.1 vs 174.3 GB/s）——
+   4-bit 解包路径在该平台上效率较差，这是本次适配中**唯一明显落后于英伟达的项**，如实记录。
+3. 报告 §7 里的"加速比"列（CPU/GPU）本次未直接对比：它取决于**主机 CPU 单线程性能**，
+   沐曦容器的主机 CPU 明显更强（同一用例 CPU 参考 522 ms vs 笔记本的 194 ms），
+   两台的 CPU/GPU 比值不可直接相除。
+
+### 12.5 在沐曦平台复现
+
+```bash
+cd proj_lowprec
+MACA_PATH=/opt/maca bash build_maca.sh
+export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH
+
+BIN=./build_maca/lowprec bash tests/run_tests.sh     # 36/36
+
+# 性能对照
+./build_maca/lowprec gen normal 4096 4096 /tmp/p.bin
+./build_maca/lowprec quant /tmp/p.bin configs/mxfp8_tensor_fp16.cfg /tmp/perf
+```
