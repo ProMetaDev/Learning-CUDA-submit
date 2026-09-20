@@ -2,6 +2,7 @@
 
 > 选题：2026 夏季训练营 CUDA 方向项目阶段 · 选题三
 > 环境：WSL2 Ubuntu 22.04 + CUDA 12.2 + NVIDIA RTX 5070 Ti Laptop (12 GB)，编译目标 `sm_90`
+> 国产平台适配：沐曦 MetaX 曦云 C500 + MACA 3.5.3（见第 9 节，已实测验证，13/13 通过）
 > 参考实现：NumPy / PyTorch 2.13（float64 定义式计算）；CPU 参考使用 OpenMP
 
 ---
@@ -270,7 +271,7 @@ GPU 矩阵乘基线可以直接顶上做正确性校验。
 3. **融合仅支持 block_size = 32**：更大块需要跨槽位归约，可扩展。
 4. **未使用 Tensor Core**：题目把它列为加分项。FP8 Tensor Core 路径可以在
    支持该特性的 GPU 上作为可选分支加入。
-5. **未做国产平台适配**（代码无架构特性依赖，移植成本较低）。
+5. **国产平台适配已完成**（沐曦 曦云 C500，见第 9 节；代码无架构特性依赖，仅新增构建脚本）。
 6. **`ncu` / `nsys` 未采集**：WSL2 不透传 CUPTI（实测 ncu 报 "No kernels were profiled"），
    本报告的瓶颈判断来自 ptxas 资源报告、寄存器/spill 数据与带宽实测，
    而非 profiler 计数器；若要补齐该加分项，需在原生 Linux / AutoDL 上运行。
@@ -295,4 +296,128 @@ python3 tools/torch_ref.py outputs/data/base.txt outputs/ref.txt --n 128 --scale
 ./build/hadamard run   outputs/data/outlier.txt configs/fht_128_quant_e4m3.cfg outputs/results/rot
 ./build/hadamard quant outputs/data/outlier.txt configs/fht_128_quant_e4m3.cfg outputs/results/raw
 grep rel_L2 outputs/results/rot.log outputs/results/raw.log
+```
+
+---
+
+## 9. 国产平台适配：沐曦（MetaX 曦云 C500 / MACA）
+
+### 9.1 平台环境与编译方式
+
+| 项目   | 值                                                                                |
+| ---- | -------------------------------------------------------------------------------- |
+| 加速卡  | 沐曦 曦云 C500（`mx-smi` 2.2.12，KMD 3.8.30）                                           |
+| 设备属性 | `warpSize = 64`，104 个 SM，`maxThreadsPerBlock = 1024`，共享内存 64 KB/block，计算能力 `(10,0)` |
+| 软件栈  | MACA 3.5.3.20（SDK 3.5.3.307），CUDA 兼容层由 `tools/cu-bridge` 提供                       |
+| 编译器  | `mxcc 1.0.0`（`/opt/maca/mxgpu_llvm/bin/mxcc`）                                     |
+
+本工程原本用 CMake + nvcc，沐曦平台改用 [`build_maca.sh`](build_maca.sh)：
+
+```bash
+mxcc -x maca -offload-arch native --maca-path=/opt/maca \
+     -Iinclude -I/opt/maca/tools/cu-bridge/include -L/opt/maca/lib \
+     -imacros __macro_mxcc.h -forward-unknown-to-compiler \
+     -fgpu-rdc --maca-link -lToolsExt_cu -lruntime_cu -lmcToolsExt \
+     -std=c++17 -O3 -use-fast-math \
+     src/main.cpp src/io.cpp src/cpu_ref.cpp src/fht.cu -o build_maca/hadamard
+
+export LD_LIBRARY_PATH=/opt/maca/lib
+```
+
+测试脚本支持 `BIN=` 覆盖，无需修改工程：
+
+```bash
+BIN=./build_maca/hadamard bash tests/run_tests.sh
+```
+
+### 9.2 移植中唯一的坎：`HD_HD` 宏没生效（**源码依旧零改动**）
+
+首次编译报错（8 处）：
+
+```
+error: call to __host__ function 'f32_to_e4m3' from __global__ function 'fht_quant_kernel'
+note: candidate function not viable: call to __host__ function from __global__ function
+```
+
+原因是 `include/fp8.h` 里这样写：
+
+```c
+#ifdef __CUDACC__
+#define HD_HD __host__ __device__
+#else
+#define HD_HD
+#endif
+```
+
+nvcc 会定义 `__CUDACC__`，而直接调用 `mxcc` 时它**不定义**，于是 `HD_HD` 退化成空，
+所有 FP8 转换函数都变成 host-only。
+
+沐曦的解法在 `tools/cu-bridge/include/__macro_mxcc.h` 里已经给好了：
+
+```c
+#define __NVCC__ 1
+#ifdef __MACACC__
+#define __CUDACC__
+#endif
+```
+
+这个头文件需要**显式 `-imacros`** 才会生效（沐曦自己的 `cucc` 包装器会自动加，直接调 `mxcc` 就得自己加）。
+补上 `-imacros __macro_mxcc.h` 后一次编译通过 —— **本工程没有改一行源码**。
+
+（另注：`-use-fast-math` 用连字符，不是 nvcc 的 `-use_fast_math`；写错会被 mxcc 解析成 `-u se_fast_math`。）
+
+### 9.3 正确性验证：项目自带测试 13/13 通过
+
+`BIN=./build_maca/hadamard bash tests/run_tests.sh`：
+
+| 测试组                 | 内容                                          | 结果       |
+| ------------------- | ------------------------------------------- | -------- |
+| 0                   | 引擎自检                                        | ✅ PASS   |
+| 1                   | GPU FHT vs PyTorch/定义式参考，n ∈ {64,128,256}   | ✅ 3/3    |
+| 2                   | scale = 1/√n 正交归一化，n ∈ {64,128,256}        | ✅ 3/3    |
+| 3                   | 输入精度 fp32 / fp16 / bf16                     | ✅ 3/3    |
+| 4                   | 融合 kernel 与分离式**逐字节一致**，e4m3 / e5m2           | ✅ 2/2    |
+| 5                   | Hadamard 旋转降低量化误差（outlier 数据）              | ✅ PASS   |
+| **合计**              |                                             | **13/13 全部通过** |
+
+**数值结果与英伟达平台逐位一致**（这是比"通过阈值"更强的证据）：
+
+| 指标（outlier 数据, E4M3, block=32） | NVIDIA RTX 5070 Ti | 沐曦 C500        |
+| ------------------------------ | ------------------ | -------------- |
+| 未旋转 rel\_L2                    | 2.632483e-02       | **2.632482886e-02** |
+| 旋转后 rel\_L2                    | 2.621887e-02       | **2.621887e-02**    |
+| 另一组（4096 行）未旋转 → 旋转后           | 2.692815e-02 → 2.648389e-02 | 2.692815e-02 → 2.648389e-02 |
+
+### 9.4 性能对照（rows=262144, cols=128，输入 134 MB）
+
+| 项目                     | NVIDIA RTX 5070 Ti    | 沐曦 C500              |
+| ---------------------- | --------------------- | -------------------- |
+| FHT kernel             | 3.742 ms / 71.7 GB/s  | **1.544 ms / 173.8 GB/s** |
+| 量化 kernel（分离式）         | 0.640 ms / 263.6 GB/s | 0.699 ms / 241.5 GB/s |
+| **融合 kernel（FHT+量化）** | **0.481 ms / 351.1 GB/s** | 0.622 ms / 271.4 GB/s |
+| 融合 vs (FHT+分离量化)       | 9.11×                 | 3.61×                |
+| 朴素 GPU 矩阵乘基线           | —                     | 36.80 ms             |
+| FHT vs 该基线              | 9.20×                 | **23.83×**           |
+
+**读法（重要）**：C500 上"融合加速比"显示为 3.61× 而非 9.11×，**并不是融合变差了**：
+
+- C500 的 **FHT 单独执行快 2.4×**（71.7 → 173.8 GB/s）—— §4.2 记录过本内核在小 n 下是**访存延迟受限**，
+  而 C500 对这类模式更友好；
+- 融合 kernel 本身只慢 1.3×（351.1 → 271.4 GB/s）；
+- 由于"融合加速比"是 `(FHT + 量化) / 融合`，分母（FHT 单独）变快，比值自然变小。
+
+换句话说：**融合优化的绝对收益（少写 100 MB 数据、少一次 kernel 启动）在两个平台都成立**，
+C500 上 FHT 与量化原本就更快，所以可压缩的余量也更小。
+
+### 9.5 在沐曦平台复现
+
+```bash
+cd proj_hadamard
+MACA_PATH=/opt/maca bash build_maca.sh
+export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH
+
+BIN=./build_maca/hadamard bash tests/run_tests.sh     # 13/13
+
+./build_maca/hadamard gen normal 262144 128 outputs/data/base.txt --seed 7
+./build_maca/hadamard run outputs/data/base.txt configs/fht_128_quant_e4m3.cfg outputs/results/run
 ```
