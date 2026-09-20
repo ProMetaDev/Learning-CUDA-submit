@@ -2,7 +2,8 @@
 
 > 选题：2026 夏季训练营 CUDA 方向项目阶段 · 选题六（贸易网络路由）
 > 环境：WSL2 Ubuntu 22.04 + CUDA 12.2 + NVIDIA RTX 5070 Ti Laptop (12 GB)，编译目标 `sm_90`
-> 国产平台：天数智芯 Iluvatar MR-V100 (32 GB) + IX-ML 4.4.0 / CoreX SDK 4.4.0（见第 9 节，已验证）
+> 国产平台：① 天数智芯 Iluvatar MR-V100 + IX-ML 4.4.0 / CoreX SDK 4.4.0（见第 9 节）
+> 　　　　　② 沐曦 MetaX 曦云 C500 + MACA 3.5.3（见第 10 节）—— 两者均已实测验证
 > 算法：Push-Relabel（GPU）+ BFS 全局重标号 + Gap 重标号；CPU 参考用 Edmonds-Karp
 
 ***
@@ -426,7 +427,7 @@ CPU 参考实现本身用**独立的 Python Edmonds-Karp** 交叉验证过（见
 | 组件                                | 实现方式                                               |
 | --------------------------------- | -------------------------------------------------- |
 | Push / Relabel / BFS / Gap kernel | 纯手写 CUDA C++，仅用 `atomicAdd`、`atomicCAS`            |
-| 64 位原子加                           | NVIDIA 上由 `atomicCAS` 自实现；国产平台改用两个 32 位原子模拟（见 9.2） |
+| 64 位原子加                           | NVIDIA 与沐曦走 `atomicCAS` 自实现；天数平台改用两个 32 位原子模拟（见 9.2） |
 | CPU 参考                            | 自实现 Edmonds-Karp（仅用 STL `queue` / `vector`）        |
 | 图生成器                              | 自实现（Python，纯标准库）                                   |
 | 第三方库                              | **无**（仅 CUDA Runtime + C++ 标准库）                    |
@@ -456,8 +457,8 @@ CPU 参考实现本身用**独立的 Python Edmonds-Karp** 交叉验证过（见
    如需补齐该加分项，需在原生 Linux / AutoDL 上运行。
 6. **测试图均为合成随机图**。缺少真实贸易网络（如 UN Comtrade 导出的
    双边贸易矩阵）验证，真实图的度分布与社区结构可能与随机图差异较大。
-7. **国产平台只验证了天数智芯一家**（见第 9 节）。海光 DCU / 华为昇腾 / 摩尔线程等
-   其他国产加速卡的编译链路与原子操作语义差异未做验证。
+7. **国产平台验证了两家**（天数智芯、沐曦，见第 9、10 节）。海光 DCU / 华为昇腾 /
+   摩尔线程等其他国产加速卡的编译链路与原子操作语义差异未做验证。
 
 **优化方向**：
 
@@ -656,4 +657,118 @@ export LD_LIBRARY_PATH=/usr/local/corex-4.4.0/lib64:$LD_LIBRARY_PATH
 ```
 
 `--cpu-ref` 会逐查询比对 GPU 与 CPU，不一致则以非零码退出，可直接当作回归测试。
+
+***
+
+## 10. 国产平台适配之二：沐曦（MetaX 曦云 C500 / MACA）
+
+在完成天数智芯适配后，本项目又在**沐曦 曦云 C500**上做了完整验证。
+与天数不同：**这次源码改动为零**，只需新增一个构建脚本。
+
+### 10.1 目标平台环境
+
+| 项目         | 值                                                                                |
+| ---------- | -------------------------------------------------------------------------------- |
+| 加速卡        | 沐曦 曦云 C500（`mx-smi` 2.2.12，KMD 3.8.30）                                           |
+| 设备属性       | `warpSize = 64`，104 个 SM，`maxThreadsPerBlock = 1024`，每 block 共享内存 64 KB，计算能力 `(10,0)` |
+| 软件栈        | MACA 3.5.3.20（SDK 3.5.3.307），CUDA 兼容层由 `tools/cu-bridge` 提供                       |
+| 编译器        | `mxcc 1.0.0`（LLVM/clang 系，路径 `/opt/maca/mxgpu_llvm/bin/mxcc`）                     |
+| 容器         | Ubuntu 22.04 + Python 3.10                                                       |
+
+编译命令（已封装为 [`build_maca.sh`](build_maca.sh)）：
+
+```bash
+mxcc -x maca -offload-arch native --maca-path=/opt/maca \
+     -Iinclude -I/opt/maca/tools/cu-bridge/include -L/opt/maca/lib \
+     -fgpu-rdc --maca-link -lToolsExt_cu -lruntime_cu -lmcToolsExt \
+     -std=c++17 -O3 src/main.cpp src/io.cpp src/cpu_ref.cpp src/gpu_maxflow.cu -o maxflow
+
+export LD_LIBRARY_PATH=/opt/maca/lib        # 运行前必须设置
+```
+
+### 10.2 移植中唯一的坎：cu-bridge 的链接参数不能只取一半
+
+沐曦不重写源码，而是用 `tools/cu-bridge` 做**编译期映射**：头文件把 `cudaXxx`
+声明成 `wcudaXxx`，实现体在 `/opt/maca/lib/libruntime_cu.so` 里。
+如果只照着官方 samples 的 `-x maca -offload-arch native` 编译，会在**链接期**炸出一屏：
+
+```
+undefined reference to `wcudaMalloc'
+undefined reference to `wcudaGetLastError'
+undefined reference to `wcudaMemcpy'  ...
+```
+
+正解是从 cu-bridge 自带的 `bin/conf.json` 的 `[link][adder]` 段抄全（这段就是官方为
+CUDA 工程准备的自动追加项）：
+
+```
+-fgpu-rdc --maca-link -lToolsExt_cu -lruntime_cu -lmcToolsExt
+```
+
+补上之后一次性通过。另外 `tools/cu-bridge/bin/cucc`（面向 CUDA 工程的包装器）在本容器里
+不可用 —— 它把路径拼成了 `/tools/cu-bridge//bin/gomxccbin`（缺 `MACA_PATH` 前缀），
+所以直接用 `mxcc` 比走 `cucc` 稳。
+
+### 10.3 与天数智芯的关键差异（这条决定了要不要改代码）
+
+| 检查项                                | 天数 MR-V100     | 沐曦 C500 |
+| --------------------------------- | -------------- | ------- |
+| `warpSize`                        | 64             | 64      |
+| `atomicAdd(unsigned long long*)`  | ❌ 静默失效（恒为 0）   | ✅ 正确    |
+| `atomicCAS(unsigned long long*)`  | ❌ 自旋死循环        | ✅ 正确    |
+| 设备侧 FP64                          | ✅              | ✅       |
+| `maxThreadsPerBlock`              | 4096           | 1024    |
+| 每 block 共享内存                      | 128 KB         | 64 KB   |
+
+也就是说：9.2 里那套"两个 32 位原子模拟 64 位加"是**天数专属**的补丁，
+沐曦上 64 位原子完全正常，走默认的 `atomicCAS` 路径即可 —— 这正是本项目能在沐曦上
+**零改动**移植的原因。（两个平台的宏分支互不影响，同一份源码两边都能编。）
+
+### 10.4 验证结果（曦云 C500）
+
+`./build_maca/maxflow selftest` → **PASS**。
+六档规模、每档 12 个查询，GPU 与 CPU Edmonds-Karp **逐查询全部一致**：
+
+| 规模 (N, M)           | 阶段数 | T\_preprocess | TTFQ     | T\_total   | TPQ        |
+| ------------------- | --- | ------------- | -------- | ---------- | ---------- |
+| 20, 100             | 16  | 23.35 ms      | 5.54 ms  | 42.30 ms   | 3.52 ms    |
+| 100, 800            | 24  | 22.86 ms      | 9.94 ms  | 55.23 ms   | 4.60 ms    |
+| 500, 4000           | 64  | 22.16 ms      | 1.95 ms  | 46.15 ms   | 3.85 ms    |
+| 2000, 20000         | 56  | 21.88 ms      | 2.48 ms  | 50.96 ms   | 4.25 ms    |
+| 10000, 100000       | 112 | 29.93 ms      | 3.02 ms  | 69.98 ms   | 5.83 ms    |
+| **100000, 1000000** | 328 | 71.91 ms      | 27.11 ms | 262.42 ms  | **21.87 ms** |
+
+> tiny–large 为单次测量，big / target 为 2 次测量（两次相差 < 3%）。
+> 计 12 个查询的平均值即 TPQ。目标规模下 12 个查询全部与 CPU 一致。
+
+**阶段数在三个平台上逐档完全一致**（NVIDIA / 天数智芯 / 沐曦均为 16 / 24 / 64 / 56 / 112 / 328），
+这是对"同一份算法映射"最强的交叉证据。
+
+### 10.5 三平台性能对照（题目目标规模 10⁵ 节点 / 10⁶ 边）
+
+| 平台                     | T\_preprocess | TTFQ     | T\_total   | TPQ        |
+| ---------------------- | ------------- | -------- | ---------- | ---------- |
+| NVIDIA RTX 5070 Ti     | 257.9 ms      | 17.65 ms | 144.98 ms  | **12.08 ms** |
+| 天数智芯 MR-V100           | 78.6 ms       | 17.00 ms | 174.13 ms  | 14.51 ms   |
+| 沐曦 曦云 C500             | 71.9 ms       | 27.11 ms | 262.42 ms  | 21.87 ms   |
+
+三点解读：
+
+1. **三家的 TPQ 在同一量级**（12.1 / 14.5 / 21.9 ms），最大差距约 1.8×，
+   说明本实现的瓶颈在算法与访存模式，而不是某一家的硬件特性。
+2. **T\_preprocess 反而是国产卡更小**。这部分是主机端 `build_residual_graph` + H2D 拷贝，
+   与 GPU 无关，差异来自云主机 CPU 与磁盘。
+3. 沐曦的 TPQ 比天数高约 50%，但它的 SM 数（104）远多于天数（16）。小规模档
+   （tiny/small）的绝对值受固定启动/同步开销支配，本表不作微架构层面的归因。
+
+### 10.6 在沐曦平台复现
+
+```bash
+cd proj_maxflow
+MACA_PATH=/opt/maca bash build_maca.sh          # 产物 build_maca/maxflow
+export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH
+
+./build_maca/maxflow selftest
+./build_maca/maxflow run tests/tmp/target.csr tests/tmp/target.q /tmp/target.res --cpu-ref
+```
 

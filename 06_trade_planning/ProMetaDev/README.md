@@ -21,7 +21,9 @@ proj_maxflow/
 │   ├── run_tests.sh   # 端到端测试脚本
 │   └── benchmark.sh   # 性能基准测试
 ├── CMakeLists.txt
-├── build.sh
+├── build.sh           # NVIDIA / nvcc
+├── build_iluvatar.sh  # 天数智芯 Iluvatar CoreX
+├── build_maca.sh      # 沐曦 MetaX（曦云 C500 / MACA）
 └── README.md
 ```
 
@@ -35,6 +37,20 @@ bash build.sh [SM_ARCH]
 ```
 
 产物：`build/maxflow`
+
+### 国产平台构建
+
+同一份源码在两家国产加速卡上均已实测通过，各自提供了独立构建脚本：
+
+```bash
+# 天数智芯（Iluvatar CoreX）：clang++ -x ivcore
+COREX_HOME=/usr/local/corex-4.4.0 bash build_iluvatar.sh
+
+# 沐曦（MetaX / MACA）：mxcc -x maca
+MACA_PATH=/opt/maca bash build_maca.sh
+```
+
+两者的详细环境、踩坑记录与性能对照见 [`report.md`](report.md) 第 9、10 节。
 
 ## 使用
 
